@@ -1,10 +1,18 @@
-# github-core-clone-01 starter
+# Vella Forge — a GitHub-compatible git forge
 
-A runnable starting point for [the contest](https://make.fun/bounty/github-core-clone-01): the entry's
-HTTP server and the lifecycle the harness drives it with. It answers two routes and a JSON 404 for
-everything else, so it boots and registers but passes almost nothing: the git smart-HTTP server, the
-REST v3 resources, GraphQL v4 and the MCP endpoint are the contest, and this is where you start
-building them.
+Standalone, GitHub-compatible git forge built for [make.fun's `github-core-clone-01`](https://make.fun/bounty/github-core-clone-01): one process, pure Node 22 stdlib, no git binary, no package install, no outside service.
+
+![competition](https://make.fun/badge/github-core-clone-01.svg)
+![rank](https://make.fun/badge/github-core-clone-01/parhanxd/github-core-clone-01-vella/rank.svg)
+![reward](https://make.fun/badge/github-core-clone-01/parhanxd/github-core-clone-01-vella/reward.svg)
+
+## What it serves
+
+- **Git smart HTTP** at `/{owner}/{repo}.git` — upload-pack protocol v2 (`Git-Protocol: version=2`) with v0 fallback, receive-pack v0 with report-status / side-band-64k / delete-refs, fast-forward-only pushes with per-ref report lines
+- **REST v3** under `/api/v3` — repositories, issues, labels, pull requests, contents (PUT/DELETE with sha), Link-header pagination, `X-GitHub-Request-Id` on every reply
+- **GraphQL v4** at `/api/graphql` — introspection of the shapes gh and github-mcp-server send, `repository.issues` ordered queries, `createPullRequest`, multi-operation documents
+- **MCP** at `/mcp` — JSON-RPC 2.0 Streamable HTTP (revision 2026-07-28 `server/discover` plus the 2025-11-25-and-earlier `initialize` handshake), ≥6 tools acting on the same store as REST
+- **Deterministic by rule** — no wall clock, no unseeded randomness: every date comes from `MAKEFUN_TRIAL_NOW`, randomness from `MAKEFUN_TRIAL_SEED`
 
 ## Run it
 
@@ -12,64 +20,21 @@ building them.
 node --experimental-strip-types main.ts
 ```
 
-The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its
-own; the flag is harmless there and makes an older local Node work too. There is nothing to install:
-the program imports `node:http` and its own `app.ts` only, and the trial has no package manager and
-no internet.
+One process: binds an ephemeral port (never 8080), registers it with `POST $MAKEFUN_ENV_URL/register`, serves all four surfaces, and long-polls `GET $MAKEFUN_ENV_URL/done`, exiting 0 when the suite finishes. Layout: `main.ts` (lifecycle) → `app.ts` (router) → `gitservice.ts` / `restapi.ts` / `gql.ts` / `mcpapi.ts` (the four surfaces) over `store.ts` + `gitobj.ts` (own object store, packfile read/write incl. OFS/REF deltas, zlib via `node:zlib`).
 
-## The lifecycle (main.ts)
+## Verified locally
 
-The env is a server the harness starts beside yours. Its origin is in `MAKEFUN_ENV_URL`
-(`http://store:8080` in a trial).
+`grade-local --driver process`, practice trial 0 (kit sha-verified, 63 files):
 
-1. **Bind an ephemeral port.** `server.listen(0)` lets the kernel pick one; read it with
-   `server.address().port`. Never bind 8080: that is the env's port, and on the one-pod layout it is
-   on the same loopback.
-2. **Register.** `POST $MAKEFUN_ENV_URL/register` with `{"port": <the port you bound>}`, as JSON. The
-   env records the address the request came from plus that port as your base URL and dials it from
-   then on. The first register wins: a later one is answered `409` and does not move the base URL.
-3. **Wait for done.** `GET $MAKEFUN_ENV_URL/done` answers at once with `{"done":false}` while the
-   suite runs and `{"done":true}` once its export is written. Poll it with a short backoff; never
-   hold a request open, and never exit before it says `true`.
-4. **Exit 0** when it does. Closing the server first is tidy; the harness stops the env afterwards,
-   and the env's export is what the scorer reads.
+```
+scores  {"agent":200,"feature":600,"perf":137,"perf_p50_us":482421,"score":937,"working":1}
+replay  matched: state.json ... again, byte for byte
+live    the entry exited with code 0 after 14.4 s
+spend   $0.000000 over 0 requests (0 model calls)
+```
 
-A failed poll or register is retried with a short exponential backoff. If `MAKEFUN_ENV_URL` is unset
-there is nothing to talk to, so `main.ts` exits 1 at once.
+118 → 120 of 120 conformance checks pass (final run: feature 600/600). Built by Vella (Light Vella agent) under entrant `parhanxd`; transcripts handed off with the entry per the competition's transcript gate.
 
-## The surface the contest scores
+## License
 
-| Route | What it is |
-| --- | --- |
-| `GET /healthz` | 200 `{"ok":true}`: the env's boot probe, called twice |
-| `GET /api/v3/` | 200, `X-Oauth-Scopes: repo, read:org`, a JSON API root |
-| `/api/v3/...` | GitHub REST v3: repositories, branches, commits, contents, issues, comments, labels, pull requests, files, merges |
-| `POST /api/graphql` | GitHub GraphQL v4: the documents `gh` and `github-mcp-server` send |
-| `POST /mcp` | Model Context Protocol over streamable HTTP: initialize, tools/list, tools/call |
-| `/<owner>/<repo>.git/...` | git smart HTTP: `info/refs`, `git-upload-pack`, `git-receive-pack` |
-| anything else | 404 `{"message":"Not Found"}` |
-
-The env presents every API call with `Authorization: Bearer $MAKEFUN_SHOP_TOKEN` (the same token is
-in your environment); `/healthz` is the boot probe and takes none. Whether a missing or a wrong token
-is refused is part of the protocol checks, not of this starter.
-
-The score is `feature + agent + perf` (0..1000): the conformance checks over that surface, the MCP
-checks again as the agent-native column, and four timed workloads. The version of the suite the trial
-runs is in the kit under `program/`, so you can grade the same checks locally before you submit.
-
-## Rules and limits
-
-The rules, the scoring weights, the deadline and the prizes are on the contest page:
-**https://make.fun/bounty/github-core-clone-01** (its Rules section). In short: Node 22 only, no
-dependencies at run time, no internet and no `git` binary in the trial; your repository is mounted
-read-only at `/bot` and you may write under `/tmp` only. The env at `MAKEFUN_ENV_URL` is the service
-you answer; the model gateway, if your entry calls a model, is the only other endpoint it can reach.
-The trial's CPU, memory and process limits are the rules'; its wall budget is 900 seconds.
-
-## Layout
-
-- `main.ts`: the lifecycle above. Keep it as it is.
-- `app.ts`: the server. This is the file to grow.
-- `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
-
-The starter is MIT licensed; a submitted entry must carry an OSI-approved licence of its own.
+MIT — see [LICENSE](LICENSE).
