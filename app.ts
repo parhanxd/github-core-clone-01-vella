@@ -1,49 +1,87 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// The server: one router over git smart HTTP, REST v3, GraphQL v4 and MCP, on the store.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { TOKEN, userForToken } from './store.ts';
+import { gitResponse, readGitProtocolVersion } from './gitservice.ts';
+import { handleRest } from './restapi.ts';
+import { handleGraphQL } from './gql.ts';
+import { handleMcp } from './mcpapi.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
   res.end(text);
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+function pathOf(req: IncomingMessage): { path: string; query: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    const url = new URL(req.url ?? '/', 'http://entry');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
-    return '/';
+    return { path: '/', query: new URLSearchParams() };
   }
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
+function bearerToken(req: IncomingMessage): string | null {
+  const header = req.headers.authorization;
+  if (typeof header !== 'string') return null;
+  const m = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return m ? m[1] : null;
+}
+
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
+    void route(req, res);
+  });
+}
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
+async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const { path, query } = pathOf(req);
+    const method = req.method ?? 'GET';
+    const token = bearerToken(req);
+    const authed = token !== null && userForToken(token) !== null;
+
     if (method === 'GET' && path === '/healthz') {
       sendJson(res, 200, { ok: true });
       return;
     }
 
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
+    // git smart HTTP first (tokened like the API).
+    if (path.includes('.git/')) {
+      const served = await gitResponse(req, res, path, query);
+      if (served) return;
+      sendJson(res, 404, { message: 'Not Found' });
       return;
     }
 
-    // Everything else, every method: GitHub's 404 body.
+    if (path === '/api/graphql' && method === 'POST') {
+      await handleGraphQL(req, res, authed);
+      return;
+    }
+
+    if (path === '/mcp' && method === 'POST') {
+      // The MCP endpoint authenticates per request (a call with no Authorization answers 401),
+      // so auth gating happens inside the handler per message.
+      await handleMcp(req, res, authed);
+      return;
+    }
+
+    if (path.startsWith('/api/v3')) {
+      await handleRest({ req, res, method, path, query, authed });
+      return;
+    }
+
     sendJson(res, 404, { message: 'Not Found' });
-  });
+  } catch (err) {
+    if (!res.headersSent) {
+      sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal error' });
+    } else {
+      res.end();
+    }
+  }
 }
+
+export { readGitProtocolVersion, TOKEN };

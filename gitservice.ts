@@ -14,8 +14,8 @@ const DELIM = '0001';
 
 function pkt(text: string | Buffer): Buffer {
   const payload = Buffer.isBuffer(text) ? text : Buffer.from(text, 'utf8');
-  const head = Buffer.from(payload.length + 4 >= 65536 ? [0xff, 0xff, 0xff, 0xff] : [0, 0, 0, 0]);
-  head.writeUInt16BE(payload.length + 4, 0);
+  const len = payload.length + 4;
+  const head = Buffer.from(len.toString(16).padStart(4, '0'), 'ascii');
   return Buffer.concat([head, payload]);
 }
 
@@ -113,7 +113,7 @@ function receivePackV0Advertisement(repo: Repo): Buffer {
 
 // ---------------------------------------------------------------- object reachability
 
-function* walkCommits(repo: Repo, tips: string[]): Generator<string> {
+function* walkCommits(repo: Repo, tips: string[], stopAt?: Set<string>): Generator<string> {
   const seen = new Set<string>();
   const queue = [...tips];
   while (queue.length) {
@@ -124,6 +124,7 @@ function* walkCommits(repo: Repo, tips: string[]): Generator<string> {
     if (!obj) continue;
     if (obj.type === 'commit') {
       yield oid;
+      if (stopAt?.has(oid)) continue;
       for (const p of parseCommit(obj.data).parents) if (!seen.has(p)) queue.push(p);
     } else if (obj.type === 'tag') {
       const c = obj.data.toString('utf8').match(/^object ([0-9a-f]{40})/m);
@@ -132,8 +133,8 @@ function* walkCommits(repo: Repo, tips: string[]): Generator<string> {
   }
 }
 
-/** Every object reachable from `tips` (commits, their trees and blobs, annotated tags). */
-function reachableObjects(repo: Repo, tips: string[], stopAt?: Set<string>): GitObj[] {
+/** Every object reachable from `tips`: commits (stopping at `stopAt`, which is excluded), their trees and blobs, and tag objects. */
+function closureObjects(repo: Repo, tips: string[], stopAt?: Set<string>): Map<string, GitObj> {
   const out = new Map<string, GitObj>();
   const treeDone = new Set<string>();
   const addTree = (oid: string): void => {
@@ -141,33 +142,118 @@ function reachableObjects(repo: Repo, tips: string[], stopAt?: Set<string>): Git
     treeDone.add(oid);
     const obj = repo.objects.get(oid);
     if (!obj) return;
-    out.set(oid, obj);
+    if (!stopAt?.has(oid)) out.set(oid, obj);
     if (obj.type === 'tree') {
       for (const e of parseTree(obj.data)) addTree(e.oid);
     }
   };
+  // Tag objects named by tips (and chains of tags).
+  const tagQueue = [...tips];
+  const tagSeen = new Set<string>();
+  while (tagQueue.length) {
+    const oid = tagQueue.shift()!;
+    if (tagSeen.has(oid)) continue;
+    tagSeen.add(oid);
+    const obj = repo.objects.get(oid);
+    if (!obj || obj.type !== 'tag') continue;
+    if (!stopAt?.has(oid)) out.set(oid, obj);
+    const m = obj.data.toString('utf8').match(/^object ([0-9a-f]{40})/m);
+    if (m) tagQueue.push(m[1]);
+  }
   for (const tip of tips) {
-    for (const oid of walkCommits(repo, [tip])) {
+    for (const oid of walkCommits(repo, [tip], stopAt)) {
       if (stopAt?.has(oid)) continue;
       const obj = repo.objects.get(oid);
       if (!obj) continue;
       out.set(oid, obj);
       if (obj.type === 'commit') addTree(parseCommit(obj.data).tree);
-      if (obj.type === 'tag') {
-        const m = obj.data.toString('utf8').match(/^object ([0-9a-f]{40})/m);
-        if (m) {
-          const tagged = repo.objects.get(m[1]);
-          if (tagged) out.set(m[1], tagged);
-        }
-      }
     }
   }
-  return [...out.values()];
+  return out;
+}
+
+function parentsOf(repo: Repo, oids: Iterable<string>): Set<string> {
+  const out = new Set<string>();
+  for (const oid of oids) {
+    const obj = repo.objects.get(oid);
+    if (obj?.type === 'commit') for (const p of parseCommit(obj.data).parents) out.add(p);
+  }
+  return out;
+}
+
+/** Compute the object set to pack for one fetch request. */
+function fetchObjectSet(repo: Repo, wants: string[], haves: string[], clientShallow: string[], depth: number | null): { objects: GitObj[]; shallow: string[]; unshallow: string[] } {
+  if (depth !== null) {
+    // Generation walk from the wants: gen 1 = tips, gen n = parents at depth n-1.
+    const shallow = new Set<string>();
+    const include = new Set<string>();
+    let frontier = [...new Set(wants)];
+    for (let gen = 1; gen < depth; gen += 1) {
+      const next: string[] = [];
+      for (const oid of frontier) {
+        const obj = repo.objects.get(oid);
+        if (!obj || obj.type !== 'commit') { shallow.add(oid); continue; }
+        const parents = parseCommit(obj.data).parents;
+        include.add(oid);
+        if (parents.length === 0) shallow.add(oid);
+        else for (const p of parents) next.push(p);
+      }
+      frontier = [...new Set(next)];
+      if (frontier.length === 0) break;
+    }
+    for (const oid of frontier) {
+      include.add(oid);
+      shallow.add(oid);
+    }
+    const clientShallowSet = new Set(clientShallow);
+    const stopAt = parentsOf(repo, shallow);
+    const send = closureObjects(repo, wants, stopAt.size ? stopAt : undefined);
+    // What the client truly holds: its shallow cuts (everything up to each shallow tip), else its haves.
+    const clientHas = new Set<string>();
+    if (clientShallowSet.size) {
+      for (const cs of clientShallowSet) {
+        for (const oid of closureObjects(repo, [cs], parentsOf(repo, [cs])).keys()) clientHas.add(oid);
+      }
+    } else if (haves.length) {
+      for (const oid of closureObjects(repo, haves).keys()) clientHas.add(oid);
+    }
+    const objects: GitObj[] = [];
+    for (const [oid, obj] of send) if (!clientHas.has(oid)) objects.push(obj);
+    const unshallow: string[] = [];
+    const shallowLines: string[] = [];
+    for (const oid of clientShallowSet) if (include.has(oid)) unshallow.push(oid);
+    for (const oid of shallow) if (!clientShallowSet.has(oid)) shallowLines.push(oid);
+    return { objects, shallow: shallowLines, unshallow };
+  }
+  const send = closureObjects(repo, wants);
+  if (haves.length) {
+    const clientHas = closureObjects(repo, haves);
+    const objects: GitObj[] = [];
+    for (const [oid, obj] of send) if (!clientHas.has(oid)) objects.push(obj);
+    return { objects, shallow: [], unshallow: [] };
+  }
+  return { objects: [...send.values()], shallow: [], unshallow: [] };
 }
 
 // ---------------------------------------------------------------- upload-pack v2
 
-function lsRefsV2(repo: Repo, args: Set<string>, prefixes: string[]): Buffer {
+function lsRefsArgsOf(body: Buffer): { args: Set<string>; prefixes: string[] } {
+  const pkts = decodePktLines(body);
+  const args = new Set<string>();
+  const prefixes: string[] = [];
+  let pastDelim = false;
+  for (const p of pkts) {
+    if (p.kind === 'delim') { pastDelim = true; continue; }
+    if (p.kind !== 'data' || !pastDelim) continue;
+    const line = p.payload.toString('utf8').replace(/\n$/, '');
+    if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
+    else if (line !== '') args.add(line);
+  }
+  return { args, prefixes };
+}
+
+function lsRefsV2(repo: Repo, body: Buffer): Buffer {
+  const { args, prefixes } = lsRefsArgsOf(body);
   const wantPeel = args.has('peel');
   const wantSymrefs = args.has('symrefs');
   const wantUnborn = args.has('unborn');
@@ -204,38 +290,8 @@ function lsRefsV2(repo: Repo, args: Set<string>, prefixes: string[]): Buffer {
   return pktLines(lines);
 }
 
-/** Compute the shallow boundary for wants at `depth` (1 = tips only). */
-function shallowBoundary(repo: Repo, tips: string[], depth: number): { shallow: Set<string>; unshallow: Set<string>; include: Set<string> } {
-  const shallow = new Set<string>();
-  const include = new Set<string>();
-  let frontier = [...new Set(tips)];
-  for (let gen = 1; gen < depth; gen += 1) {
-    const next: string[] = [];
-    for (const oid of frontier) {
-      const obj = repo.objects.get(oid);
-      if (!obj || obj.type !== 'commit') continue;
-      const parents = parseCommit(obj.data).parents;
-      if (parents.length === 0) shallow.add(oid);
-      else {
-        include.add(oid);
-        for (const p of parents) next.push(p);
-      }
-    }
-    frontier = [...new Set(next)];
-    if (frontier.length === 0) break;
-  }
-  for (const oid of frontier) {
-    include.add(oid);
-    const obj = repo.objects.get(oid);
-    if (obj && obj.type === 'commit' && parseCommit(obj.data).parents.length > 0) shallow.add(oid);
-    else shallow.add(oid);
-  }
-  return { shallow, unshallow: new Set<string>(), include };
-}
-
 function fetchV2(repo: Repo, body: Buffer): Buffer {
   const pkts = decodePktLines(body);
-  const lines: string[] = pkts.filter((p) => p.kind === 'data').map((p) => p.payload.toString('utf8').replace(/\n$/, ''));
   const args = new Set<string>();
   const wants: string[] = [];
   const haves: string[] = [];
@@ -243,9 +299,10 @@ function fetchV2(repo: Repo, body: Buffer): Buffer {
   let depth: number | null = null;
   let done = false;
   let pastDelim = false;
-  for (const line of lines) {
-    if (line === 'delim') { pastDelim = true; continue; }
-    if (line === 'flush') continue;
+  for (const p of pkts) {
+    if (p.kind === 'delim') { pastDelim = true; continue; }
+    if (p.kind === 'flush') continue;
+    const line = p.payload.toString('utf8').replace(/\n$/, '');
     if (!pastDelim) { args.add(line); continue; }
     const sp = line.indexOf(' ');
     const key = sp < 0 ? line : line.slice(0, sp);
@@ -257,36 +314,17 @@ function fetchV2(repo: Repo, body: Buffer): Buffer {
     else if (key === 'done') done = true;
   }
   if (wants.length === 0) return Buffer.from(FLUSH, 'ascii');
-
-  // Object set: tips minus history the client already has (haves/shallow boundaries).
-  let objects: GitObj[];
-  let shallowLines: string[] = [];
-  if (depth !== null) {
-    const boundary = shallowBoundary(repo, wants, depth);
-    const stopAt = new Set([...boundary.shallow]);
-    for (const oid of boundary.shallow) {
-      const obj = repo.objects.get(oid);
-      if (obj?.type === 'commit') {
-        for (const p of parseCommit(obj.data).parents) stopAt.add(p);
-      }
-    }
-    objects = reachableObjects(repo, wants, stopAt);
-    shallowLines = [...boundary.shallow].map((s) => `shallow ${s}\n`);
-    void clientShallow;
-    void haves;
-  } else {
-    const stopAt = new Set<string>(haves);
-    objects = reachableObjects(repo, wants, haves.length ? stopAt : undefined);
-  }
+  const set = fetchObjectSet(repo, wants, haves, clientShallow, depth);
   const sections: Buffer[] = [];
-  if (shallowLines.length) {
+  if (set.shallow.length || set.unshallow.length) {
     sections.push(pkt('shallow-info\n'));
-    for (const l of shallowLines) sections.push(pkt(l));
+    for (const oid of set.shallow) sections.push(pkt(`shallow ${oid}\n`));
+    for (const oid of set.unshallow) sections.push(pkt(`unshallow ${oid}\n`));
     sections.push(Buffer.from(FLUSH, 'ascii'));
   }
   sections.push(pkt('packfile\n'));
-  const pack = writePack(objects);
-  const MAX = 65519;
+  const pack = writePack(set.objects);
+  const MAX = 65515;
   let off = 0;
   while (off < pack.length) {
     const chunk = pack.subarray(off, Math.min(off + MAX, pack.length));
@@ -295,46 +333,58 @@ function fetchV2(repo: Repo, body: Buffer): Buffer {
   }
   sections.push(Buffer.from(FLUSH, 'ascii'));
   sections.push(Buffer.from(FLUSH, 'ascii'));
+  void done;
+  void args;
   return Buffer.concat(sections);
+}
+
+function dispatchV2(repo: Repo, body: Buffer): Buffer {
+  const pkts = decodePktLines(body);
+  let command = '';
+  for (const p of pkts) {
+    if (p.kind !== 'data') break;
+    const line = p.payload.toString('utf8').replace(/\n$/, '');
+    if (line.startsWith('command=')) {
+      command = line.slice('command='.length);
+      break;
+    }
+  }
+  if (command === 'ls-refs') return lsRefsV2(repo, body);
+  return fetchV2(repo, body);
 }
 
 // ---------------------------------------------------------------- upload-pack v0
 
 function v0UploadPack(repo: Repo, body: Buffer): Buffer {
   const pkts = decodePktLines(body);
-  const lines = pkts.filter((p) => p.kind === 'data').map((p) => p.payload.toString('utf8').replace(/\n$/, ''));
   const wants: string[] = [];
   const haves: string[] = [];
-  let sawFlush = false;
-  for (const line of lines) {
-    if (line === '') { sawFlush = true; continue; }
+  let shallowSeen: string[] = [];
+  for (const p of pkts) {
+    if (p.kind !== 'data') continue;
+    const line = p.payload.toString('utf8').replace(/\n$/, '');
     const sp = line.indexOf(' ');
     const key = sp < 0 ? line : line.slice(0, sp);
     const value = sp < 0 ? '' : line.slice(sp + 1);
     if (key === 'want') wants.push(value);
     else if (key === 'have') haves.push(value);
-    else if (key === 'done') sawFlush = true;
+    else if (key === 'shallow') shallowSeen.push(value);
   }
   if (wants.length === 0) return Buffer.from('0008NAK\n', 'ascii');
-  const stopAt = new Set(haves);
-  const objects = reachableObjects(repo, wants, haves.length ? stopAt : undefined);
+  const set = fetchObjectSet(repo, wants, haves, shallowSeen, null);
   const parts: Buffer[] = [];
-  const caps = 'side-band-64k agent=' + AGENT;
-  parts.push(pkt(`NAK\n`));
-  const pack = writePack(objects);
-  const MAX = 65519;
+  for (const oid of set.shallow) parts.push(pkt(`shallow ${oid}\n`));
+  parts.push(pkt('NAK\n'));
+  const pack = writePack(set.objects);
+  const MAX = 65515;
   let off = 0;
-  if (pack.length === 0) {
-    parts.push(pkt(Buffer.concat([Buffer.from([1])])));
-  }
+  if (pack.length === 0) parts.push(pkt(Buffer.concat([Buffer.from([1])])));
   while (off < pack.length) {
     const chunk = pack.subarray(off, Math.min(off + MAX, pack.length));
     parts.push(pkt(Buffer.concat([Buffer.from([1]), chunk])));
     off += chunk.length;
   }
   parts.push(Buffer.from(FLUSH, 'ascii'));
-  void caps;
-  void sawFlush;
   return Buffer.concat(parts);
 }
 
@@ -372,14 +422,14 @@ function receivePack(repo: Repo, body: Buffer): Buffer {
   }
   // unpack
   let unpackOk = true;
-  let unpackDetail = 'unpack ok';
+  let unpackDetail = 'ok';
   if (packBytes.length) {
     try {
       const parsed = readPack(packBytes, (oid) => repo.objects.get(oid));
       for (const [oid, obj] of parsed.objects) if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
     } catch (err) {
       unpackOk = false;
-      unpackDetail = `unpack failed: ${err instanceof Error ? err.message : String(err)}`;
+      unpackDetail = err instanceof Error ? err.message : String(err);
     }
   } else if (commands.some((c) => c.newOid !== '0'.repeat(40))) {
     unpackOk = false;
@@ -443,7 +493,7 @@ function receivePack(repo: Repo, body: Buffer): Buffer {
   const inner = pktLines(reportText.split('\n').filter((l) => l !== '').map((l) => `${l}\n`));
   if (!useSideband) return inner;
   const parts: Buffer[] = [];
-  const MAX = 65519;
+  const MAX = 65515;
   let off = 0;
   while (off < inner.length) {
     const chunk = inner.subarray(off, Math.min(off + MAX, inner.length));
@@ -528,7 +578,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
   const body = await readBody(req);
   const contentType = `application/x-${service}-result`;
   if (service === 'git-upload-pack') {
-    const out = version === 2 ? fetchV2(repo, body) : v0UploadPack(repo, body);
+    const out = version === 2 ? dispatchV2(repo, body) : v0UploadPack(repo, body);
     res.writeHead(200, { 'content-type': contentType, 'cache-control': 'no-cache' });
     res.end(out);
     return true;

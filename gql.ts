@@ -873,77 +873,71 @@ function walkSelections(
   }
 }
 
+function introspectionTypeRef(name: string): Record<string, unknown> {
+  return { kind: name.endsWith('!') ? 'NON_NULL' : 'SCALAR', name, ofType: null };
+}
+
+function introspectionField(name: string): Record<string, unknown> {
+  return {
+    name,
+    description: null,
+    isDeprecated: false,
+    deprecationReason: null,
+    args: [],
+    type: introspectionTypeRef('String'),
+  };
+}
+
+/** __type / __schema: a plain object graph the normal selection walker projects. */
 function introspect(sel: FieldNode, variables: Record<string, unknown>, errors: GqlError[], path: (string | number)[]): unknown {
+  void errors;
+  void path;
   if (sel.name === '__schema') {
-    return { queryType: { name: 'Query' }, mutationType: { name: 'Mutation' } };
+    const types = Object.keys(SCHEMA_FIELDS).map((name) => introspectType(name));
+    return {
+      queryType: { name: 'Query', kind: 'OBJECT', fields: (SCHEMA_FIELDS.Query ?? []).map(introspectionField) },
+      mutationType: { name: 'Mutation', kind: 'OBJECT', fields: (SCHEMA_FIELDS.Mutation ?? []).map(introspectionField) },
+      subscriptionType: null,
+      types,
+      directives: [],
+    };
   }
   const args = resolveArgs(sel.args ?? new Map(), variables);
   const typeName = args.get('name');
   if (typeof typeName !== 'string') return null;
+  return introspectType(typeName);
+}
+
+function introspectType(typeName: string): Record<string, unknown> | null {
   const fields = SCHEMA_FIELDS[typeName];
   if (fields === undefined) return null;
   if (ENUM_TYPES.has(typeName)) {
     return {
       name: typeName,
       kind: 'ENUM',
+      description: null,
       fields: null,
-      enumValues: (sel.selections ?? []).length ? buildEnumResult(typeName, sel.selections!) : null,
+      enumValues: fields.map((v) => ({ name: v, description: null, isDeprecated: false, deprecationReason: null })),
       inputFields: null,
       interfaces: null,
       possibleTypes: null,
       ofType: null,
-      description: null,
     };
   }
   return {
     name: typeName,
     kind: 'OBJECT',
-    fields: buildFieldResult(fields, sel.selections ?? []),
-    enumValues: null,
-    inputFields: null,
-    interfaces: [],
-    possibleTypes: null,
-    ofType: null,
     description: null,
+    fields: fields.map(introspectionField),
+    enumValues: null,
+    inputFields: [],
+    interfaces: [],
+    possibleTypes: [],
+    ofType: null,
     specifiedByURL: null,
   };
 }
 
-function buildFieldResult(fields: string[], selections: SelectionNode[]): unknown[] {
-  return fields.map((f) => {
-    const child: Record<string, unknown> = {};
-    const node: Record<string, unknown> = { name: f, description: null, isDeprecated: false, deprecationReason: null, args: [], type: { name: 'String', kind: 'SCALAR', ofType: null } };
-    // run whatever sub-selection was asked (typically { name })
-    const fake = { __field: node };
-    for (const sel of selections) {
-      if (sel.kind !== 'field') continue;
-      if (sel.name === 'name') child[sel.alias ?? 'name'] = f;
-      else if (sel.name === 'description') child[sel.alias ?? 'description'] = null;
-      else if (sel.name === 'isDeprecated') child[sel.alias ?? 'isDeprecated'] = false;
-      else if (sel.name === 'deprecationReason') child[sel.alias ?? 'deprecationReason'] = null;
-      else if (sel.name === 'args') child[sel.alias ?? 'args'] = [];
-      else if (sel.name === 'type') child[sel.alias ?? 'type'] = { name: 'String', kind: 'SCALAR', ofType: null };
-    }
-    void fake;
-    void node;
-    return child;
-  });
-}
-
-function buildEnumResult(typeName: string, selections: SelectionNode[]): unknown[] {
-  const values = SCHEMA_FIELDS[typeName] ?? [];
-  return values.map((v) => {
-    const child: Record<string, unknown> = {};
-    for (const sel of selections) {
-      if (sel.kind !== 'field') continue;
-      if (sel.name === 'name') child[sel.alias ?? 'name'] = v;
-      else if (sel.name === 'description') child[sel.alias ?? 'description'] = null;
-      else if (sel.name === 'isDeprecated') child[sel.alias ?? 'isDeprecated'] = false;
-      else if (sel.name === 'deprecationReason') child[sel.alias ?? 'deprecationReason'] = null;
-    }
-    return child;
-  });
-}
 
 // ---------------------------------------------------------------- the HTTP surface
 

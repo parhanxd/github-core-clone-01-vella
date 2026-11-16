@@ -68,13 +68,15 @@ async function readJsonBody(req: IncomingMessage): Promise<{ ok: true; body: Rec
   }
 }
 
+let currentOrigin = 'http://localhost';
+
 function linkHeader(basePath: string, query: URLSearchParams, page: number, perPage: number, total: number): Record<string, string> {
   const last = Math.max(1, Math.ceil(total / perPage));
   const mk = (p: number, rel: string): string => {
     const q = new URLSearchParams(query);
     q.set('page', String(p));
     q.set('per_page', String(perPage));
-    return `<${basePath}${q.toString() ? `?${q.toString()}` : ''}>; rel="${rel}"`;
+    return `<${currentOrigin}${basePath}${q.toString() ? `?${q.toString()}` : ''}>; rel="${rel}"`;
   };
   const parts: string[] = [];
   if (page > 1) parts.push(mk(page - 1, 'prev'));
@@ -248,7 +250,7 @@ function commonAncestor(repo: Repo, a: string, b: string): string | null {
 
 // ---------------------------------------------------------------- contents helpers
 
-function contentEntry(repo: Repo, ref: string, path: string): { type: 'file'; oid: string; data: Buffer } | { type: 'dir'; entries: TreeEntry[] } | null {
+function contentEntry(repo: Repo, ref: string, path: string): { type: 'file'; oid: string; data: Buffer } | { type: 'dir'; oid: string } | null {
   const sha = resolveRefish(repo, ref);
   if (sha === null) return null;
   const treeOid = treeOf(repo, sha);
@@ -265,7 +267,7 @@ function contentEntry(repo: Repo, ref: string, path: string): { type: 'file'; oi
     const last = i === parts.length - 1;
     const isTree = entry.mode === '40000' || entry.mode === '040000';
     if (last) {
-      if (isTree) return { type: 'dir', entries };
+      if (isTree) return { type: 'dir', oid: entry.oid };
       const blob = repo.objects.get(entry.oid);
       if (!blob) return null;
       return { type: 'file', oid: entry.oid, data: blob.data };
@@ -289,6 +291,8 @@ interface Ctx {
 
 export async function handleRest(ctx: Ctx): Promise<boolean> {
   const { req, res, method, path } = ctx;
+  const host = ctx.req.headers.host ?? 'localhost';
+  currentOrigin = `http://${host}`;
   if (!path.startsWith('/api/v3')) return false;
   const sub = path.slice('/api/v3'.length) || '/';
   const route = sub.length > 1 ? sub.replace(/\/+$/, '') : '/';
@@ -692,7 +696,8 @@ async function handleRepoRoutes(ctx: Ctx, repo: Repo, tail: string): Promise<boo
       if (ancestor !== null) {
         const ancObj = repo.objects.get(ancestor);
         const ancTree = ancObj && ancObj.type === 'commit' ? parseCommit(ancObj.data).tree : null;
-        const baseTree = treeOf(repo, pull.baseSha);
+        const baseTip = repo.refs.get(pull.baseRef) ?? pull.baseSha;
+        const baseTree = treeOf(repo, baseTip);
         const headTree = treeOf(repo, pull.headSha);
         const ancFlat = ancTree ? commitTreeState(repo, ancTree) : new Map<string, { oid: string; mode: string }>();
         for (const [p, e] of commitTreeState(repo, baseTree!)) if (ancFlat.get(p)?.oid !== e.oid) baseChanges.add(p);
@@ -700,9 +705,10 @@ async function handleRepoRoutes(ctx: Ctx, repo: Repo, tail: string): Promise<boo
       }
       for (const p of baseChanges) if (headChanges.has(p)) return sendError(res, 405, 'Pull Request is not mergeable: conflicts'), true;
       const headTree = treeOf(repo, pull.headSha)!;
+      const baseTip = repo.refs.get(pull.baseRef) ?? pull.baseSha;
       const mergeCommit = buildCommit({
         tree: headTree,
-        parents: [pull.baseSha],
+        parents: [baseTip],
         author: `${AUTHOR} ${commitTimestamp()}`,
         committer: `${AUTHOR} ${commitTimestamp()}`,
         message: `${pull.title} (#${pull.number})`,
@@ -739,7 +745,7 @@ function commitShape(repo: Repo, sha: string, info: ReturnType<typeof parseCommi
       url: `/api/v3/repos/${repoFullName(repo)}/git/commits/${sha}`,
       author: { name: nameOf(info.author), email: emailOf(info.author), date: dateOf(info.author) },
       committer: { name: nameOf(info.committer), email: emailOf(info.committer), date: dateOf(info.committer) },
-      message: info.message,
+      message: info.message.replace(/\n$/, ''),
       tree: { sha: info.tree, url: `/api/v3/repos/${repoFullName(repo)}/git/trees/${info.tree}` },
       comment_count: 0,
       verification: { verified: false, reason: 'unsigned', signature: null, payload: null },
